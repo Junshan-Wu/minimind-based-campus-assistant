@@ -1,0 +1,15 @@
+# 模型权重与训练产物（服务器上现下现生成，不进库）
+minimind-3/
+out/
+checkpoints/
+*.pth
+*.safetensors
+*.gguf
+
+# 环境
+.venv/
+__pycache__/
+*.pyc
+
+# 原始资料（可能涉版权/隐私，只在本地留）
+data/raw/
