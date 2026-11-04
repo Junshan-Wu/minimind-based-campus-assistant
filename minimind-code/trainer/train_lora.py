@@ -21,9 +21,14 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
+# ========== loss 曲线记录（不改动训练逻辑，每个 epoch 记一条平均 loss） ==========
+LOSS_HISTORY = []  # [(epoch, 该 epoch 的 token 级平均 loss), ...]
+LOSS_PLOT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'images'))
+
 
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     start_time = time.time()
+    loss_sum, tok_sum = 0.0, 0  # 用于统计本 epoch 的 token 级平均 loss
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
@@ -35,6 +40,11 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
+
+        # 按「参与计算的 token 数」加权累计：等价于整个 epoch 的总损失 / 总 token 数
+        n_tok = (labels != -100).sum().item()
+        loss_sum += loss.item() * args.accumulation_steps * n_tok
+        tok_sum += n_tok
 
         scaler.scale(loss).backward()
 
@@ -65,14 +75,71 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             model.train()
 
         del input_ids, labels, res, loss
+    return loss_sum / max(tok_sum, 1)
+
+
+def save_loss_curve(history, lora_name, out_dir):
+    """把每个 epoch 的平均 loss 画成曲线，存到 out_dir。
+
+    history 形如 [(epoch, loss), ...]，其中 loss 是该 epoch 的 token 级平均损失，
+    等价于「epoch 内总损失 / 该 epoch 参与计算的总 token 数」。
+    没装 matplotlib 时只写 csv 并提示，绘图异常也吞掉，绝不打断训练。
+    图中坐标轴用英文，避免 Linux 上没有中文字体导致方框乱码。
+    """
+    if not history or not is_main_process():
+        return
+    try:
+        import csv
+        import datetime
+
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        base = os.path.join(out_dir, f'loss_{lora_name}_{stamp}')
+
+        with open(base + '.csv', 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['epoch', 'loss'])
+            writer.writerows(history)
+
+        epochs = [ep for ep, _ in history]
+        losses = [loss for _, loss in history]
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            Logger(f'[loss] 未安装 matplotlib，跳过绘图（pip install matplotlib）；明细见 {base}.csv')
+            return
+
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(epochs, losses, marker='o', linewidth=2, label=f'{lora_name} (epoch mean)')
+        for x, y in zip(epochs, losses):
+            ax.annotate(f'{y:.3f}', (x, y), textcoords='offset points',
+                        xytext=(0, 8), ha='center', fontsize=8)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.set_title(f'LoRA training loss - {lora_name}')
+        if 1 < len(epochs) <= 20:
+            ax.set_xticks(epochs)
+        ax.grid(alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(base + '.png', dpi=150)
+        fig.savefig(os.path.join(out_dir, f'loss_{lora_name}_latest.png'), dpi=150)
+        plt.close(fig)
+        Logger(f'[loss] 曲线已保存: {base}.png')
+    except Exception as e:  # 任何绘图问题都不应影响训练产物
+        Logger(f'[loss] 绘制曲线失败（不影响模型权重）: {e}')
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind LoRA Fine-tuning")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument("--lora_rank", default=16, type=int, help="LoRA rank")
-    parser.add_argument("--lora_name", type=str, default="lora_medical", help="LoRA权重名称(如lora_identity/lora_medical等)")
-    parser.add_argument("--epochs", type=int, default=10, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--lora_name", type=str, default="lora_CAT", help="LoRA权重名称(如lora_identity/lora_medical等)")
+    parser.add_argument("--epochs", type=int, default=50, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
@@ -85,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="../dataset/campus_qa.jsonl", help="LoRA训练数据路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/cat.jsonl", help="LoRA训练数据路径")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练，默认full_sft")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
@@ -168,11 +235,15 @@ if __name__ == "__main__":
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, lora_params, start_step, wandb)
+            epoch_loss = train_epoch(epoch, loader, len(loader) + skip, lora_params, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
+            epoch_loss = train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
+        LOSS_HISTORY.append((epoch + 1, epoch_loss))
     
-    # ========== 10. 清理分布进程 ==========
+    # ========== 10. loss 曲线导出（失败不影响训练结果） ==========
+    save_loss_curve(LOSS_HISTORY, args.lora_name, LOSS_PLOT_DIR)
+    
+    # ========== 11. 清理分布进程 ==========
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
